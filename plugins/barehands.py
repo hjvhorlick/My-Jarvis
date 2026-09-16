@@ -51,7 +51,15 @@ def _port() -> int:
 
 
 def _url(role: str = "") -> str:
-    return f"http://127.0.0.1:{_port()}/stage.html" + (f"?role={role}" if role else "")
+    # @@CAM@@ pin the camera by (part of) its name; blank = browser default / last used
+    q = []
+    if role:
+        q.append(f"role={role}")
+    cam = str(_cfg("camera", "") or "").strip()
+    if cam and cam.lower() != "auto":
+        import urllib.parse
+        q.append("cam=" + urllib.parse.quote(cam))
+    return f"http://127.0.0.1:{_port()}/stage.html" + (("?" + "&".join(q)) if q else "")
 
 
 def _alive() -> bool:
@@ -407,6 +415,7 @@ PLUGIN_SETTINGS = {
         {"key": "browser",    "type": "choice", "label": "Browser",
          "options": ["opera", "default", "chrome", "brave"], "default": "opera"},
         {"key": "port",       "type": "text",   "label": "Port", "default": "8794"},
+        {"key": "camera",     "type": "text",   "label": "Camera (part of its name, e.g. Microdia; blank = auto)", "default": "Microdia"},
     ],
     "action": {"label": "▶ / ■  START · STOP BAREHANDS", "run": _toggle_action},
 }
