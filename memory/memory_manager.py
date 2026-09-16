@@ -15,7 +15,7 @@ def get_base_dir() -> Path:
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
 _lock            = Lock()
-MAX_VALUE_LENGTH = 380
+MAX_VALUE_LENGTH = 1200
 
 # ── Why there are two very different numbers here ────────────────────────────
 #
@@ -42,7 +42,7 @@ PROMPT_CORE_CHARS = 900
 PROMPT_INDEX_CHARS = 420
 # Most entries any one category may contribute to the core block, so a person
 # with forty stored preferences still gets their sister into the prompt.
-PROMPT_MAX_PER_CATEGORY = 6
+PROMPT_MAX_PER_CATEGORY = 20
 
 def _empty_memory() -> dict:
     return {
@@ -347,7 +347,7 @@ def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
     return score
 
 
-def search_memory(query: str, limit: int = 8) -> str:
+def search_memory(query: str, limit: int = 20) -> str:
     """Find stored facts matching `query`. Backs the recall_memory tool.
 
     An empty query is treated as "show me everything you know", capped - the
@@ -439,7 +439,7 @@ def save_session_summary(summary: str, language: str = "") -> None:
         sessions = []
     entry: dict = {
         "date":    datetime.now().strftime("%Y-%m-%d"),
-        "summary": summary[:280],
+        "summary": summary[:900],
     }
     if language:
         entry["language"] = language
