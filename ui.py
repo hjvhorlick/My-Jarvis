@@ -3869,6 +3869,25 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_plugin_settings)
         lay.addWidget(settings_btn)
 
+        # @@BAREHANDS_BTN@@ — one-click start/stop of the hand-tracked board
+        bh_btn = QPushButton("🖐  BAREHANDS")
+        bh_btn.setFixedHeight(26)
+        bh_btn.setFont(QFont("Courier New", 7))
+        bh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        bh_btn.setStyleSheet(_BTN_STYLE_DIM)
+        def _bh_toggle(_=False):
+            def _w():
+                try:
+                    import importlib
+                    bh = importlib.import_module("plugins.barehands")
+                    ok, msg = bh._toggle_action({})
+                    self._log_sig.emit(f"BAREHANDS: {msg}")
+                except Exception as e:
+                    self._log_sig.emit(f"ERR: barehands — {e}")
+            threading.Thread(target=_w, daemon=True).start()
+        bh_btn.clicked.connect(_bh_toggle)
+        lay.addWidget(bh_btn)
+
         w.adjustSize()
         return w
 
