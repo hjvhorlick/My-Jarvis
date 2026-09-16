@@ -1999,8 +1999,14 @@ class AudioDeviceOverlay(_HudOverlay):
             lay.addWidget(box)
             return box
 
-        self._in_box  = _row("MICROPHONE — what JARVIS hears you with",
-                             "input", get_input_device())
+        # @@MIC_PRIORITY@@ saved value may be "preferred > backup"
+        _saved_in = get_input_device() or ""
+        _parts = [x.strip() for x in _saved_in.split(">")] if ">" in _saved_in else [_saved_in, ""]
+        self._in_box  = _row("MICROPHONE — preferred (e.g. the USB / camera mic)",
+                             "input", _parts[0])
+        lay.addSpacing(4)
+        self._in2_box = _row("BACKUP MICROPHONE — used when the preferred one is not plugged in",
+                             "input", _parts[1] if len(_parts) > 1 else "")
         lay.addSpacing(4)
         self._out_box = _row("SPEAKERS — what JARVIS talks through",
                              "output", get_output_device())
@@ -2044,6 +2050,10 @@ class AudioDeviceOverlay(_HudOverlay):
             save_input_device, save_output_device,
         )
         new_in  = self._in_box.currentData()  or ""
+        _bk     = getattr(self, "_in2_box", None)
+        _bk     = (_bk.currentData() or "") if _bk is not None else ""
+        if _bk and _bk != new_in:
+            new_in = f"{new_in} > {_bk}" if new_in else _bk
         new_out = self._out_box.currentData() or ""
         changed = (new_in != get_input_device()) or (new_out != get_output_device())
         save_input_device(new_in)

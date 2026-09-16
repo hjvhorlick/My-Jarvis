@@ -346,6 +346,21 @@ def list_devices(kind: str, refresh: bool = False) -> list[str]:
 
 
 def resolve(name: str, kind: str):
+    """@@MIC_PRIORITY@@ A saved name may be "primary > backup": the first entry
+    that is present and opens wins. A single name behaves exactly as before."""
+    wanted = (name or "").strip()
+    if ">" in wanted:
+        for part in [x.strip() for x in wanted.split(">") if x.strip()]:
+            got = _resolve_one(part, kind)
+            if got is not None:
+                print(f"[Audio] {kind}: using '{part}' (preferred/backup list)")
+                return got
+        print(f"[Audio] {kind}: none of the listed devices present — system default")
+        return None
+    return _resolve_one(wanted, kind)
+
+
+def _resolve_one(name: str, kind: str):
     """Turn a saved device name into something sounddevice accepts.
 
     Returns None for "system default" — which is also what we return when the
