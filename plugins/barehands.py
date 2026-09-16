@@ -12,6 +12,7 @@ web server; the browser page does the hand tracking with your webcam. Nothing le
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import signal
@@ -196,6 +197,75 @@ def _hook_state(player):
         pass
 
 
+# @@IMG@@ ── images on the glass ────────────────────────────────────────────────
+_IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_MODEL_EXT = {".glb", ".gltf", ".obj", ".stl"}
+_SEARCH_DIRS = [Path.home() / d for d in ("Pictures", "Downloads", "Desktop", "Documents")]
+
+def _airlock_list() -> list[str]:
+    out = []
+    for sub in ("misc", "fx", "models", "holo"):
+        d = _BH_DIR / "media" / sub
+        if d.exists():
+            out += [f"{sub}/{f.name}" for f in sorted(d.iterdir())
+                    if f.suffix.lower() in _IMG_EXT | _MODEL_EXT]
+    return out
+
+def _find_files(query: str, limit: int = 8) -> list[Path]:
+    """Find images/models on the user's disk whose name matches the words in query."""
+    words = [w for w in re.split(r"[^a-z0-9]+", query.lower()) if len(w) > 1]
+    hits = []
+    for root in _SEARCH_DIRS:
+        if not root.exists():
+            continue
+        for f in root.rglob("*"):
+            if len(hits) >= 400:
+                break
+            if f.is_file() and f.suffix.lower() in _IMG_EXT | _MODEL_EXT:
+                name = f.name.lower()
+                if not words or all(w in name for w in words):
+                    hits.append(f)
+    hits.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return hits[:limit]
+
+def _stage(src: Path) -> str:
+    """Copy a file into the airlock (media/misc or media/models); return 'sub/name'."""
+    sub = "models" if src.suffix.lower() in _MODEL_EXT else "misc"
+    dst = _BH_DIR / "media" / sub / src.name
+    if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+        shutil.copy2(src, dst)
+    return f"{sub}/{dst.name}"
+
+def _show_image(query_or_path: str, spotlight: bool = True, title: str = "") -> str:
+    q = (query_or_path or "").strip()
+    # 1) exact path?
+    cand = Path(q).expanduser()
+    if cand.is_file():
+        files = [cand]
+    else:
+        # 2) already in the airlock?
+        inbox = [x for x in _airlock_list() if q.lower() in x.lower()] if q else []
+        if inbox:
+            rel = inbox[0]
+            ok, msg = _cmd({"a": "present" if spotlight else "add_img", "src": rel, "title": title or Path(rel).stem})
+            return f"On the glass: {Path(rel).name}." if ok else f"Board refused it: {msg}"
+        # 3) search the disk
+        files = _find_files(q)
+    if not files:
+        return (f"I couldn't find an image matching '{q}' in Pictures, Downloads, Desktop or Documents. "
+                f"Give me the file name or drop it into {_BH_DIR}/media/misc.")
+    if len(files) > 1 and q and not cand.is_file():
+        names = ", ".join(f.name for f in files[:5])
+        # stage the newest anyway so "yes that one" works instantly
+        rel = _stage(files[0])
+        ok, msg = _cmd({"a": "present" if spotlight else "add_img", "src": rel, "title": title or files[0].stem})
+        return (f"Several matched — I put up the newest, {files[0].name}. Others: {names}. "
+                f"Say the name if you meant another.")
+    rel = _stage(files[0])
+    ok, msg = _cmd({"a": "present" if spotlight else "add_img", "src": rel, "title": title or files[0].stem})
+    return f"On the glass: {files[0].name}." if ok else f"Board refused it: {msg}"
+
+
 # ── the voice tool ─────────────────────────────────────────────────────────────
 PLUGIN = {
     "name": "barehands",
@@ -206,16 +276,17 @@ PLUGIN = {
         "stop it. When the user asks to SEE something — 'show me', 'put it up', 'put that on the "
         "board/glass' — use 'present' with a title and short body instead of reading a long answer "
         "aloud. Use 'card' to add a smaller note card, 'clear' to wipe the board, 'status' to ask "
-        "whether it is running and what is on it. Gestures for the user: raise a hand for a cursor, PINCH thumb+index to grab/move a card, open hand to release. Not for screenshots or webcam vision — that is "
+        "whether it is running and what is on it. Use action=image with query=<words from the file name, or a full path> to put a PICTURE or 3D model on the glass — it searches Pictures/Downloads/Desktop/Documents, copies the file into the board's media folder and presents it. Use action=list_images to hear what images are already available on the board. Use action=find with query to search without showing. Gestures for the user: raise a hand for a cursor, PINCH thumb+index to grab/move a card, open hand to release. Not for screenshots or webcam vision — that is "
         "screen_process."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {"type": "STRING",
-                       "description": "one of: open, close, present, card, clear, status"},
+                       "description": "one of: open, close, present, card, image, find, list_images, clear, status"},
             "title":  {"type": "STRING", "description": "heading for present/card (short, UPPERCASE ok)"},
             "body":   {"type": "STRING", "description": "text for present/card — keep under 60 words"},
+            "query":  {"type": "STRING", "description": "for image/find: words from the file name, or a full path"},
         },
         "required": ["action"],
     },
@@ -249,6 +320,28 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             if not _alive():
                 return "barehands is not running. Say 'open barehands' to start it."
             return f"barehands is running. On the board right now: {board_state()}"
+
+        if action in ("image", "picture", "photo", "show_image", "model"):
+            if not _alive():
+                ok, msg = start(open_page=True); log(msg)
+                if not ok:
+                    return f"I couldn't start the board: {msg}"
+                time.sleep(1.5)
+            q = str(parameters.get("query") or body or title or "").strip()
+            res = _show_image(q, spotlight=True, title=title); log(f"image → {q}: {res[:60]}")
+            return res
+
+        if action in ("find", "search"):
+            q = str(parameters.get("query") or body or title or "").strip()
+            files = _find_files(q)
+            if not files:
+                return f"No images matching '{q}' in Pictures, Downloads, Desktop or Documents."
+            return "Found: " + ", ".join(f.name for f in files) + ". Say 'show <name>' to put one up."
+
+        if action in ("list_images", "list"):
+            items = _airlock_list()
+            return ("On the board's shelf: " + ", ".join(Path(x).name for x in items)) if items else \
+                   "The board's media folder is empty. Ask me to show an image and I'll fetch it."
 
         if action in ("present", "card", "clear"):
             if not _alive():
