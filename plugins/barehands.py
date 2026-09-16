@@ -206,7 +206,7 @@ PLUGIN = {
         "stop it. When the user asks to SEE something — 'show me', 'put it up', 'put that on the "
         "board/glass' — use 'present' with a title and short body instead of reading a long answer "
         "aloud. Use 'card' to add a smaller note card, 'clear' to wipe the board, 'status' to ask "
-        "whether it is running and what is on it. Not for screenshots or webcam vision — that is "
+        "whether it is running and what is on it. Gestures for the user: raise a hand for a cursor, PINCH thumb+index to grab/move a card, open hand to release. Not for screenshots or webcam vision — that is "
         "screen_process."
     ),
     "parameters": {
