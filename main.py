@@ -889,10 +889,18 @@ class JarvisLive:
 
             else:
                 if self._plugin_registry.has(name):
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
-                    )
+                    # @@TOOL_TIMEOUT@@ a slow plugin must never freeze the voice loop
+                    try:
+                        r = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                            ),
+                            timeout=20.0,
+                        )
+                    except asyncio.TimeoutError:
+                        r = (f"The {name} tool is taking too long; it is still working in the background. "
+                             f"Tell the user it is slow and offer to check again in a moment.")
                     result = r or "Done."
                 else:
                     result = f"Unknown tool: {name}"

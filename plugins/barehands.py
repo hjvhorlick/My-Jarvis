@@ -212,20 +212,48 @@ def _airlock_list() -> list[str]:
     return out
 
 def _find_files(query: str, limit: int = 8) -> list[Path]:
-    """Find images/models on the user's disk whose name matches the words in query."""
+    """@@FASTFIND@@ Bounded search: max depth 3, max 2.0 s, skips hidden/huge dirs.
+    Never lets a slow disk freeze the voice loop."""
     words = [w for w in re.split(r"[^a-z0-9]+", query.lower()) if len(w) > 1]
-    hits = []
+    exts = _IMG_EXT | _MODEL_EXT
+    deadline = time.time() + 2.0
+    hits: list[Path] = []
+    skip = {"node_modules", ".cache", ".venv", "venv", "__pycache__", "snap", ".local", ".config", "barehands"}
+
+    def walk(d: Path, depth: int):
+        if depth > 3 or time.time() > deadline:
+            return
+        try:
+            with os.scandir(d) as it:
+                subs = []
+                for e in it:
+                    if time.time() > deadline:
+                        return
+                    n = e.name
+                    if n.startswith("."):
+                        continue
+                    try:
+                        if e.is_file(follow_symlinks=False):
+                            if os.path.splitext(n)[1].lower() in exts:
+                                nl = n.lower()
+                                if not words or all(w in nl for w in words):
+                                    hits.append(Path(e.path))
+                        elif e.is_dir(follow_symlinks=False) and n not in skip:
+                            subs.append(e.path)
+                    except OSError:
+                        continue
+                for sp in subs:
+                    walk(Path(sp), depth + 1)
+        except OSError:
+            return
+
     for root in _SEARCH_DIRS:
-        if not root.exists():
-            continue
-        for f in root.rglob("*"):
-            if len(hits) >= 400:
-                break
-            if f.is_file() and f.suffix.lower() in _IMG_EXT | _MODEL_EXT:
-                name = f.name.lower()
-                if not words or all(w in name for w in words):
-                    hits.append(f)
-    hits.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        if root.exists():
+            walk(root, 0)
+    try:
+        hits.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
     return hits[:limit]
 
 def _stage(src: Path) -> str:
