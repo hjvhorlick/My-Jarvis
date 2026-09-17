@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   repair-camera-stream:
-    if: ${{ !contains(github.event.head_commit.message, 'Repair live camera stream') }}
+    if: "${{ !contains(github.event.head_commit.message, 'Repair live camera stream') }}"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -63,11 +63,10 @@ jobs:
         """Keep the live feed alive until the user explicitly closes it.
 
         OpenCV can temporarily report a failed read or lose the V4L2 capture
-        handle on Linux.  The old loop used ``cap.isOpened()`` as its lifetime
+        handle on Linux. The old loop used cap.isOpened() as its lifetime
         condition, so one transient backend failure silently ended the stream.
-        This loop treats capture loss as recoverable: it releases the dead
-        handle, reopens the configured camera, and continues until
-        ``stop_camera_stream()`` sets ``_cam_stop``.
+        This loop treats capture loss as recoverable and reopens the camera
+        until stop_camera_stream() explicitly sets _cam_stop.
         """
         try:
             import cv2
@@ -97,8 +96,6 @@ jobs:
                             break
                         continue
 
-                    # Keep latency low on Linux and avoid building a large
-                    # capture backlog on the low-power laptop.
                     try:
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     except Exception:
@@ -120,15 +117,10 @@ jobs:
                             )
                             if ok:
                                 self._cam_frame_sig.emit(buf.tobytes())
-                            # ~10 FPS is enough for this preview and prevents
-                            # Qt's main event queue from being flooded.
                             if self._cam_stop.wait(0.10):
                                 break
                         else:
                             failed_reads += 1
-                            # A handful of consecutive failures means this
-                            # capture handle is unhealthy. Reopen it rather than
-                            # ending the user-visible camera session.
                             if failed_reads >= 10:
                                 break
                             if self._cam_stop.wait(0.05):
@@ -152,7 +144,6 @@ jobs:
           if old not in text:
               raise SystemExit("Expected camera loop was not found; refusing to modify ui.py")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
-
           subprocess.run(["python", "-m", "py_compile", "ui.py"], check=True)
 
       - name: Commit repair
