@@ -111,6 +111,26 @@ def _cv2_backend() -> int:
     return cv2.CAP_ANY
 
 
+def _linux_camera_names() -> list[tuple[int, str]]:
+    """Return Linux V4L2 camera indexes with their kernel-reported names."""
+    if not sys.platform.startswith("linux"):
+        return []
+
+    result: list[tuple[int, str]] = []
+    video_root = Path("/sys/class/video4linux")
+    if not video_root.exists():
+        return result
+
+    for node in sorted(video_root.glob("video*")):
+        try:
+            index = int(node.name.replace("video", ""))
+            name = (node / "name").read_text(encoding="utf-8").strip()
+            result.append((index, name))
+        except (ValueError, OSError):
+            continue
+    return result
+
+
 def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
 
     if not _CV2:
@@ -132,6 +152,27 @@ def _detect_camera_index() -> int:
 
     backend = _cv2_backend()
     print("[Vision] 🔍 Auto-detecting camera...")
+
+    # On Linux, prefer a real external USB/UVC webcam over the laptop's
+    # integrated camera. The numeric /dev/video index is not stable enough to
+    # use as the only identifier, so save the device name as well.
+    if sys.platform.startswith("linux"):
+        candidates = _linux_camera_names()
+        external = [
+            item for item in candidates
+            if any(token in item[1].lower() for token in ("usb", "uvc", "webcam"))
+        ]
+        ordered = external + [item for item in candidates if item not in external]
+
+        for idx, name in ordered:
+            if _probe_camera(idx, backend):
+                print(f"[Vision] ✅ Camera found at index {idx}: {name}")
+                _save_config_key("camera_index", idx)
+                _save_config_key("camera_name", name)
+                return idx
+            print(f"[Vision] ⚠️  Camera index {idx} ({name}): no usable frame")
+
+    # Generic fallback for Windows/macOS or unusual Linux camera setups.
     for idx in range(6):
         if _probe_camera(idx, backend):
             print(f"[Vision] ✅ Camera found at index {idx}")
@@ -146,8 +187,23 @@ def _detect_camera_index() -> int:
 
 def _get_camera_index() -> int:
     cfg = _load_config()
+
+    # Re-resolve a saved Linux camera by its stable kernel-reported name.
+    # This prevents /dev/video numbering changes from silently selecting the
+    # laptop camera after reconnecting the external USB webcam.
+    saved_name = cfg.get("camera_name")
+    if saved_name and sys.platform.startswith("linux"):
+        for idx, name in _linux_camera_names():
+            if name == saved_name and _probe_camera(idx, _cv2_backend()):
+                if cfg.get("camera_index") != idx:
+                    _save_config_key("camera_index", idx)
+                return idx
+
     if "camera_index" in cfg:
-        return int(cfg["camera_index"])
+        index = int(cfg["camera_index"])
+        if _probe_camera(index, _cv2_backend()):
+            return index
+
     return _detect_camera_index()
 
 
