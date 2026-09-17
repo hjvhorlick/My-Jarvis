@@ -153,9 +153,10 @@ def _detect_camera_index() -> int:
     backend = _cv2_backend()
     print("[Vision] 🔍 Auto-detecting camera...")
 
-    # On Linux, prefer a real external USB/UVC webcam over the laptop's
-    # integrated camera. The numeric /dev/video index is not stable enough to
-    # use as the only identifier, so save the device name as well.
+    # On Linux, prefer a real external USB/UVC webcam. A physical V4L2 camera
+    # can expose multiple /dev/video nodes; the first node that opens is not
+    # necessarily the usable image stream. Test each node and remember the
+    # exact working path.
     if sys.platform.startswith("linux"):
         candidates = _linux_camera_names()
         external = [
@@ -166,9 +167,11 @@ def _detect_camera_index() -> int:
 
         for idx, name in ordered:
             if _probe_camera(idx, backend):
-                print(f"[Vision] ✅ Camera found at index {idx}: {name}")
+                device_path = f"/dev/video{idx}"
+                print(f"[Vision] ✅ Camera found at {device_path}: {name}")
                 _save_config_key("camera_index", idx)
                 _save_config_key("camera_name", name)
+                _save_config_key("camera_device", device_path)
                 return idx
             print(f"[Vision] ⚠️  Camera index {idx} ({name}): no usable frame")
 
@@ -187,21 +190,27 @@ def _detect_camera_index() -> int:
 
 def _get_camera_index() -> int:
     cfg = _load_config()
+    backend = _cv2_backend()
 
-    # Re-resolve a saved Linux camera by its stable kernel-reported name.
-    # This prevents /dev/video numbering changes from silently selecting the
-    # laptop camera after reconnecting the external USB webcam.
+    # Re-resolve a saved Linux webcam by its physical device name, then test
+    # every matching V4L2 node. This avoids accidentally selecting video3 or
+    # another secondary interface belonging to the same webcam.
     saved_name = cfg.get("camera_name")
     if saved_name and sys.platform.startswith("linux"):
-        for idx, name in _linux_camera_names():
-            if name == saved_name and _probe_camera(idx, _cv2_backend()):
+        matching = [
+            (idx, name) for idx, name in _linux_camera_names()
+            if name == saved_name
+        ]
+        for idx, name in matching:
+            if _probe_camera(idx, backend):
                 if cfg.get("camera_index") != idx:
                     _save_config_key("camera_index", idx)
+                _save_config_key("camera_device", f"/dev/video{idx}")
                 return idx
 
     if "camera_index" in cfg:
         index = int(cfg["camera_index"])
-        if _probe_camera(index, _cv2_backend()):
+        if _probe_camera(index, backend):
             return index
 
     return _detect_camera_index()
