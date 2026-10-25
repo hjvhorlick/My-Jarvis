@@ -255,5 +255,95 @@ class InstallAdviceTests(unittest.TestCase):
         self.assertIn("espeakng-loader", err)
 
 
+class DefaultPlayerTests(unittest.TestCase):
+    def _install_fake_audio_stack(self):
+        """Stub numpy + sounddevice inside the player's import scope."""
+        import types
+
+        calls = []
+
+        class FakeArray(list):
+            def astype(self, _dtype):
+                return FakeArray(self)
+
+            def __truediv__(self, scalar):
+                return FakeArray(v / scalar for v in self)
+
+        fake_np = types.ModuleType("numpy")
+        fake_np.zeros = lambda n, dtype=None: FakeArray([0.0] * n)
+        fake_np.frombuffer = lambda b, dtype=None: FakeArray([0] * (len(b) // 2))
+        fake_np.float32 = "float32"
+        fake_np.int16 = "int16"
+
+        fake_sd = types.ModuleType("sounddevice")
+        fake_sd.play = lambda audio, rate, device=None: calls.append(
+            ("play", len(audio), rate, device)
+        )
+        fake_sd.wait = lambda: calls.append(("wait",))
+
+        return calls, fake_np, fake_sd
+
+    def test_player_wakes_the_output_before_speaking(self):
+        # PipeWire suspends idle outputs; the first utterance after idle can
+        # be swallowed. The player must open the device (silent burst + gap)
+        # before the real audio — observed live on an Ubuntu laptop.
+        import array as _array
+
+        import sys
+
+        calls, fake_np, fake_sd = self._install_fake_audio_stack()
+        old = {k: sys.modules.get(k) for k in ("numpy", "sounddevice")}
+        sys.modules["numpy"] = fake_np
+        sys.modules["sounddevice"] = fake_sd
+        try:
+            samples = _array.array("h", [1000, -1000] * 50)
+            ls._default_player(samples, 22050, device=None)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds, ["play", "wait", "play", "wait"])
+        # First burst is the 60 ms wake-up silence, then the speech itself.
+        self.assertEqual(calls[0][1], int(22050 * 0.06))
+        self.assertEqual(calls[2][1], 100)
+
+    def test_player_still_speaks_if_the_wake_up_fails(self):
+        import array as _array
+
+        import sys
+        import types
+
+        calls, fake_np, fake_sd = self._install_fake_audio_stack()
+
+        attempts = []
+
+        def broken_play(audio, rate, device=None):
+            attempts.append(len(audio))
+            if len(attempts) == 1:   # the wake-up burst fails
+                raise OSError("device unavailable")
+            calls.append(("play", len(audio), rate, device))
+
+        fake_sd.play = broken_play
+        old = {k: sys.modules.get(k) for k in ("numpy", "sounddevice")}
+        sys.modules["numpy"] = fake_np
+        sys.modules["sounddevice"] = fake_sd
+        try:
+            samples = _array.array("h", [1000, -1000] * 50)
+            ls._default_player(samples, 22050)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds, ["play", "wait"])
+
+
 if __name__ == "__main__":
     unittest.main()

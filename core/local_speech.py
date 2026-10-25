@@ -377,9 +377,24 @@ def _candidate_backends() -> list:
 
 
 def _default_player(samples: array.array, rate: int, device=None) -> None:
-    """Play int16 mono PCM through sounddevice (same stack as Gemini audio)."""
+    """Play int16 mono PCM through sounddevice (same stack as Gemini audio).
+
+    Wakes the output first: desktop sound servers (PipeWire on modern Linux)
+    suspend idle outputs, and on some machines the first short utterance after
+    an idle period is silently swallowed while the sink wakes up. A 60 ms
+    silent burst plus a small gap opens the device so the real audio plays
+    from its first syllable.
+    """
     import numpy as np
     import sounddevice as sd
+
+    try:
+        silence = np.zeros(int(rate * 0.06), dtype=np.float32)
+        sd.play(silence, rate, device=device)
+        sd.wait()
+        time.sleep(0.05)
+    except Exception:
+        pass  # the wake-up is best-effort; the real play below still runs
 
     audio = np.frombuffer(samples.tobytes(), dtype=np.int16).astype(np.float32) / 32768.0
     sd.play(audio, rate, device=device)
