@@ -5,6 +5,11 @@ Discovery runs once (JarvisLive.__init__ calls discover_plugins()); the resultin
 PluginRegistry is cached for the process lifetime. Enable/disable state is re-read
 from config on every call to get_tool_declarations() / run() / list_for_ui(), so
 toggling a plugin does not require restarting the app or re-importing anything.
+
+A plugin may optionally define ``attach(player=None)``. The registry calls it
+once at startup with the UI adapter, so plugins that mirror live state do not
+have to wait for their first voice-tool invocation to be wired up. An attach
+failure is logged and isolated; it never stops the other plugins from loading.
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ class PluginRecord:
     valid: bool = False
     error: str = ""
     settings: Optional[dict] = None   # optional PLUGIN_SETTINGS schema (config fields)
+    module: Optional[object] = None   # loaded module, for optional startup hooks
 
 
 class PluginRegistry:
@@ -96,6 +102,25 @@ class PluginRegistry:
             })
         return out
 
+    # -- called by main.py once after the UI adapter is ready --
+    def attach(self, player=None) -> None:
+        """Invoke each enabled plugin's optional attach(player) startup hook.
+
+        A plugin is allowed to be a pure tool with no lifecycle hook. Failures
+        are logged and isolated so one broken plugin cannot stop JARVIS or the
+        remaining plugins from starting.
+        """
+        for name, rec in self._plugins.items():
+            if not get_plugin_enabled(name):
+                continue
+            hook = getattr(rec.module, "attach", None)
+            if not callable(hook):
+                continue
+            try:
+                _call_attach(hook, player)
+            except Exception as e:
+                self._logger(f"Plugin '{name}' failed during attach(): {e}")
+
     # -- called by ui.py's Plugin Manager overlay --
     def list_for_ui(self) -> list[dict]:
         out = []
@@ -122,6 +147,24 @@ def _call_run(run_fn, parameters, player, session_memory):
     if has_var_kw or "session_memory" in sig.parameters:
         kwargs["session_memory"] = session_memory
     return run_fn(parameters, **kwargs)
+
+
+def _call_attach(attach_fn, player):
+    """Call attach() with the UI adapter under either supported parameter name.
+
+    Plugins may declare ``attach(player=None)`` or ``attach(ui=None)``; a plain
+    no-argument ``attach()`` is also valid.
+    """
+    sig = inspect.signature(attach_fn)
+    params = sig.parameters
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                     for p in params.values())
+    for name in ("player", "ui"):
+        if name in params:
+            return attach_fn(**{name: player})
+    if has_var_kw:
+        return attach_fn(player=player)
+    return attach_fn()
 
 
 def _validate(module, filename: str) -> PluginRecord:
@@ -159,7 +202,8 @@ def _validate(module, filename: str) -> PluginRecord:
         settings = None
 
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
-                         run=run_fn, file=filename, valid=True, error="", settings=settings)
+                         run=run_fn, file=filename, valid=True, error="", settings=settings,
+                         module=module)
 
 
 def discover_plugins(plugins_dir: Path, core_tool_names: set[str],

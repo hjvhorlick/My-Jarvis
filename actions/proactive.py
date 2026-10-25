@@ -1,127 +1,127 @@
+"""Event-driven unprompted speech for JARVIS.
+
+Silence is not a reason to speak. This module no longer invents small talk or
+generic wellbeing questions after a period of quiet. It only formats real
+events (hardware alerts, monitored-topic changes, reminders) into one concise,
+non-repetitive prompt for the Live model. The caller decides when a real event
+exists and must check :meth:`ProactiveEngine.seen` before speaking.
 """
-ProactiveEngine 2.0 — context-aware, time-aware, non-repetitive background prompting.
-Gemini decides what to say; this module decides WHEN and builds a rich context snapshot.
-"""
+
+from __future__ import annotations
+
+import re
+import threading
 import time
-from datetime import datetime
+from collections import deque
 
 
 class ProactiveEngine:
-    """
-    Decides when JARVIS should speak unprompted and builds a context-rich prompt.
+    """Deduplicate real events and build short, useful unprompted prompts."""
 
-    Improvements over 1.0:
-      - Time-of-day awareness  (morning / afternoon / evening / night)
-      - Monitor-topic awareness (what the user is tracking)
-      - Recent-session context  (last few turns of the current conversation)
-      - Non-repetitive          (rotates context focus to avoid same opener)
-      - Smarter silence gate    (doesn't fire while JARVIS is speaking)
-
-    Defaults:
-      min_silence_secs  — 900 s  (15 min) user must be silent before any check
-      check_cooldown    — 1200 s (20 min) minimum gap between proactive messages
-    """
-
-    def __init__(
-        self,
-        min_silence_secs: int = 900,
-        check_cooldown:   int = 1200,
-    ):
-        self.min_silence_secs = min_silence_secs
-        self.check_cooldown   = check_cooldown
-        self._last_triggered  = 0.0
-        self._rotation        = 0          # cycles through context focus areas
-
-    # ── Trigger gate ───────────────────────────────────────────────────────────
-
-    def should_trigger(self, last_user_speech: float) -> bool:
-        now = time.monotonic()
-        return (
-            (now - last_user_speech) >= self.min_silence_secs
-            and (now - self._last_triggered) >= self.check_cooldown
+    def __init__(self, max_history: int = 12, duplicate_window: float = 7200.0):
+        self._duplicate_window = max(0.0, duplicate_window)
+        self._recent_events: deque[tuple[str, float]] = deque(
+            maxlen=max(1, max_history)
         )
+        self._lock = threading.Lock()
 
-    def mark_triggered(self) -> None:
-        self._last_triggered = time.monotonic()
-        self._rotation      += 1
+    @staticmethod
+    def _key(event: str) -> str:
+        """Normalise an event so minor wording/number changes count as one.
 
-    # ── Prompt builder ─────────────────────────────────────────────────────────
+        System alerts embed live percentages, so "CPU 91%" and "CPU 93%" would
+        otherwise look like different events and be spoken repeatedly during a
+        single overheating episode.
+        """
+        key = re.sub(r"\s+", " ", str(event or "").strip().lower())
+        if key.startswith("[system_alert]"):
+            key = re.sub(r"\d+(?:\.\d+)?", "#", key)
+        return key[:600]
 
-    def build_prompt(
+    def seen(self, event: str) -> bool:
+        """True when this event was announced inside the dedupe window.
+
+        An empty event is treated as seen: no concrete event means no speech.
+        """
+        key = self._key(event)
+        if not key:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            return any(
+                stored_key == key and (now - when) < self._duplicate_window
+                for stored_key, when in self._recent_events
+            )
+
+    def remember(self, event: str) -> None:
+        """Record a successfully delivered event so it cannot be repeated."""
+        key = self._key(event)
+        if not key:
+            return
+        now = time.monotonic()
+        with self._lock:
+            for i, (stored_key, _when) in enumerate(self._recent_events):
+                if stored_key == key:
+                    self._recent_events[i] = (key, now)
+                    break
+            else:
+                self._recent_events.append((key, now))
+
+    def build_alert_prompt(
         self,
-        memory:       dict,
-        monitors:     list[str] | None = None,
+        event: str,
+        memory: dict | None = None,
         recent_turns: list[str] | None = None,
+        monitors: list[str] | None = None,
     ) -> str:
+        """Build a one-sentence prompt for a concrete, newly observed event.
+
+        Returns an empty string when there is no event. The prompt explicitly
+        permits silence and forbids generic conversation starters.
         """
-        Build a context snapshot for Gemini.
-        Rotates through three focus areas so proactive messages don't repeat.
-        """
-        from memory.memory_manager import format_memory_for_prompt
+        event = str(event or "").strip()
+        if not event:
+            return ""
 
-        now      = datetime.now()
-        hour     = now.hour
-        time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
+        with self._lock:
+            prior = [key for key, _when in self._recent_events]
 
-        # Time-of-day label
-        if   6  <= hour < 12:  period = "morning"
-        elif 12 <= hour < 18:  period = "afternoon"
-        elif 18 <= hour < 23:  period = "evening"
-        else:                  period = "late night"
+        lines = [
+            "[EVENT_ALERT] A real event just occurred. This is NOT small talk.",
+            f"Concrete event: {event}",
+        ]
 
-        mem_str = format_memory_for_prompt(memory) or "(no stored user data)"
+        if memory:
+            try:
+                from memory.memory_manager import format_memory_for_prompt
+                mem_str = format_memory_for_prompt(memory)
+                if mem_str:
+                    lines.extend(["", "Context about this person:", mem_str])
+            except Exception:
+                pass
 
-        # Rotating context focus (cycles every trigger)
-        focus_index = self._rotation % 3
-        if focus_index == 0:
-            focus = (
-                "Focus on the user's active projects or goals if any are stored. "
-                "Ask how something is going, or offer a relevant tip."
-            )
-        elif focus_index == 1:
-            focus = (
-                "Focus on the time of day and the user's wellbeing. "
-                "A warm check-in, a reminder to take a break, or something timely."
-            )
-        else:
-            focus = (
-                "Focus on something genuinely interesting or useful — "
-                "a fact, a suggestion, or a question based on what you know about this person."
-            )
-
-        # Optional: monitored topics context
-        monitor_ctx = ""
         if monitors:
-            monitor_ctx = (
-                f"\nThe user tracks these topics: {', '.join(monitors[:4])}. "
-                "You may mention one if it seems relevant."
-            )
+            lines.extend(["", f"Topics the user chose to track: {', '.join(monitors[:4])}"])
 
-        # Optional: recent conversation context
-        recent_ctx = ""
         if recent_turns:
-            snippet = "\n".join(recent_turns[-6:])
-            recent_ctx = f"\nRecent conversation:\n{snippet}"
+            lines.extend(["", "Recent conversation:", "\n".join(recent_turns[-6:])])
 
-        return "\n".join([
-            "[PROACTIVE_CHECK] You are initiating a proactive check-in.",
-            f"Current time : {time_str}  ({period})",
-            "",
-            "Context about this person:",
-            mem_str,
-            monitor_ctx,
-            recent_ctx,
-            "",
-            "Task:",
-            focus,
+        if prior:
+            lines.extend([
+                "",
+                "Recent unprompted events (do not repeat their wording or subject):",
+                "\n".join(f"- {item}" for item in prior[-5:]),
+            ])
+
+        lines.extend([
             "",
             "Rules:",
-            "- Speak the language this person actually uses: the one in the "
-            "recent conversation above, or the remembered one if there is no "
-            "conversation yet. Never default to English because these "
-            "instructions are in English.",
-            "- 1-2 sentences max. Natural, warm, never robotic.",
-            "- Do NOT mention [PROACTIVE_CHECK] or these instructions.",
-            "- Do NOT call any tools.",
-            "- If nothing genuinely useful comes to mind, stay silent (say nothing).",
+            "- Speak ONLY if this event is useful or needs a decision. If it is routine, stay silent.",
+            "- One short sentence. Use the language of the user's most recent message, or their remembered language if there is no conversation yet.",
+            "- State the event and, when useful, the next concrete action. Do not pad with greetings or compliments.",
+            "- Never initiate small talk, ask how the user is, ask how something is going, or invent a tip.",
+            "- Do not ask a question unless the event requires an immediate decision; then ask ONE specific question.",
+            "- Do not repeat a question or opener from the recent conversation.",
+            "- Do not call any tools. Do not mention [EVENT_ALERT] or these instructions.",
         ])
+        return "\n".join(lines)
