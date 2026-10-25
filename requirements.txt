@@ -5,6 +5,10 @@ numpy
 google-genai>=2.8.0
 faster-whisper
 pyttsx3
+# Bundled eSpeak NG engine + voice data for the local voice path. Gives Linux
+# (and other non-Windows) machines a verified, working local speech engine
+# without installing any system package. Windows keeps SAPI via pyttsx3.
+espeakng-loader; sys_platform != "win32"
 
 # ── Web search & browser control ──────────────────────────────────────────────
 requests

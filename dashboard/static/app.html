@@ -121,6 +121,17 @@
     #mic-btn.unsupported { opacity: 0.3; cursor: not-allowed; }
     @keyframes mic-pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.65;transform:scale(0.97)} }
 
+    /* ── SPEAKER (TTS) BUTTON ── */
+    #tts-btn {
+      background: var(--surface); border: 1px solid var(--border); color: var(--green);
+      padding: 11px 13px; font-size: 16px; line-height: 1; border-radius: 12px;
+      cursor: pointer; transition: opacity 0.15s, transform 0.1s, border-color 0.2s, color 0.2s;
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    }
+    #tts-btn:hover  { opacity: 0.82; border-color: var(--accent); }
+    #tts-btn:active { transform: scale(0.96); }
+    #tts-btn.off    { color: var(--muted); }
+
     /* ── TOAST ── */
     #toast {
       position:fixed; top:66px; left:50%; transform:translateX(-50%) translateY(-8px);
@@ -147,7 +158,8 @@
     <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send file">📎</label>
     <input type="file" id="file-inp" multiple accept="*/*" style="display:none">
-    <button id="mic-btn" onclick="doMic()" title="Voice command">🎤</button>
+    <button id="mic-btn" onclick="doMic()" title="Voice — listening starts automatically">🎤</button>
+    <button id="tts-btn" onclick="toggleTts()" title="Speak replies aloud">🔊</button>
     <button class="btn btn-wake" id="wake" onclick="doWake()">WAKE</button>
     <button class="btn btn-send" onclick="doSend()">SEND</button>
   </footer>
@@ -235,6 +247,7 @@
       if (speaker === 'jarvis') {
         d.className = 'msg msg-j';
         d.innerHTML = `<div class="lbl">Jarvis</div>${esc(text)}`;
+        speakReply(text);            // every reply is spoken, not just shown
       } else {
         d.className = 'msg msg-u';
         d.innerHTML = `<div class="lbl">You</div>${esc(text)}`;
@@ -251,6 +264,109 @@
 
     function esc(s) {
       return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    // ── Speak replies aloud (browser TTS, verified start + end) ─────────────
+    // A voice appearing in the voice list is NOT proof of speech. Every
+    // utterance is watched: if it never actually starts (autoplay policy,
+    // no usable voice, engine failure) the user gets one specific, honest
+    // message — never a fake success. The computer's own speakers remain
+    // the primary voice; this is the browser-side companion.
+    const ttsBtn = document.getElementById("tts-btn");
+    let _ttsOn   = localStorage.getItem("jarvis_speak") !== "0";
+    let _ttsVoice = null;
+    let _ttsUnlocked = false;
+    const _ttsNotified = new Set();
+
+    function _updateTtsBtn() {
+      ttsBtn.textContent = _ttsOn ? "🔊" : "🔇";
+      ttsBtn.title = _ttsOn ? "Replies are spoken — tap to mute"
+                            : "Replies are muted — tap to hear them";
+      ttsBtn.classList.toggle("off", !_ttsOn);
+    }
+
+    function toggleTts() {
+      _ttsOn = !_ttsOn;
+      localStorage.setItem("jarvis_speak", _ttsOn ? "1" : "0");
+      if (!_ttsOn && window.speechSynthesis) speechSynthesis.cancel();
+      _updateTtsBtn();
+      if (_ttsOn) speakReply("Voice on.");
+    }
+
+    function _ttsPickVoice() {
+      if (!window.speechSynthesis) return null;
+      const vs = speechSynthesis.getVoices() || [];
+      if (!vs.length) return null;
+      const wants = ["en-GB", "en_GB", "en-US", "en_US", "en"];
+      for (const w of wants) {
+        const hit = vs.find(v => v.lang && v.lang.replace("-", "_").toLowerCase() === w.toLowerCase());
+        if (hit) return hit;
+      }
+      return vs.find(v => (v.lang || "").toLowerCase().startsWith("en")) || vs[0];
+    }
+
+    if (window.speechSynthesis) {
+      _ttsVoice = _ttsPickVoice();
+      speechSynthesis.onvoiceschanged = () => { _ttsVoice = _ttsPickVoice(); };
+      // Browsers block audio until the first user gesture. Unlock silently.
+      const unlock = () => {
+        if (_ttsUnlocked) return;
+        try {
+          const u = new SpeechSynthesisUtterance(" ");
+          u.volume = 0; speechSynthesis.speak(u);
+          _ttsUnlocked = true;
+        } catch (_) {}
+      };
+      document.addEventListener("pointerdown", unlock, { once: false });
+      document.addEventListener("keydown", unlock, { once: false });
+    }
+
+    function _ttsNotifyOnce(key, msg) {
+      if (_ttsNotified.has(key)) return;
+      _ttsNotified.add(key);
+      sys(msg);
+    }
+
+    function speakReply(text) {
+      if (!_ttsOn) return;
+      text = (text || "").toString().trim();
+      if (!text) return;
+      if (!window.speechSynthesis) {
+        _ttsNotifyOnce("no-tts",
+          "This browser has no speech voice, so replies are text-only here. " +
+          "JARVIS still speaks through the computer's own speakers.");
+        return;
+      }
+      // Newest reply wins — a stale queue of old replies must never play.
+      try { speechSynthesis.cancel(); } catch (_) {}
+      const u = new SpeechSynthesisUtterance(text.slice(0, 600));
+      if (_ttsVoice) u.voice = _ttsVoice;
+      u.rate = 1.02; u.pitch = 1.0; u.volume = 1.0;
+      let started = false, finished = false;
+      const startTimer = setTimeout(() => {
+        if (started) return;
+        _ttsNotifyOnce("never-started",
+          "The browser listed a voice but never began speaking it — tap the " +
+          "page once to allow audio, then it works. Replies remain in the " +
+          "chat; JARVIS's voice still sounds on the computer itself.");
+      }, 3000);
+      u.onstart = () => { started = true; clearTimeout(startTimer); };
+      u.onend   = () => { finished = true; clearTimeout(startTimer); };
+      u.onerror = (e) => {
+        clearTimeout(startTimer);
+        if (!started) {
+          const why = (e && (e.error || e.reason)) || "speech engine error";
+          _ttsNotifyOnce("err:" + why,
+            `Browser speech failed (${why}). Replies stay in the chat — ` +
+            "JARVIS still speaks through the computer's own speakers.");
+        }
+      };
+      try { speechSynthesis.speak(u); }
+      catch (err) {
+        clearTimeout(startTimer);
+        _ttsNotifyOnce("speak-throw",
+          "Browser speech could not start (" + err + "). Replies stay in the chat.");
+      }
     }
 
     // ── File helpers ──────────────────────────────────────────────────────────
@@ -406,15 +522,21 @@
     }
 
     // ── Real-time Voice — PCM16 WebSocket → Gemini Live ──────────────────────
+    // Listening starts by itself when the dashboard opens and reconnects on
+    // its own if the link drops. Nothing else in the app gates the mic — no
+    // other feature, button or mode is a prerequisite for voice.
     const micBtn  = document.getElementById('mic-btn');
     let _voiceWs  = null;
     let _audioCtx = null;
     let _micStm   = null;
     let _audioNd  = null;
+    let _userStopped     = false;   // user tapped ⏹ → do not auto-reconnect
+    let _reconnectDelay  = 2000;
+    let _voiceStarting   = false;
 
     function _micIdle() {
       micBtn.innerHTML = '🎤';
-      micBtn.title     = 'Voice — tap to speak';
+      micBtn.title     = 'Voice — listening is automatic; tap to stop';
       micBtn.classList.remove('recording');
     }
 
@@ -462,98 +584,157 @@
       });
     }
 
-    async function doMic() {
-      if (_voiceWs) { _stopVoice(); return; }
-
-      if (!navigator.mediaDevices?.getUserMedia) {
-        _showVoiceSetup();
+    async function doMic(userTap = true) {
+      if (_voiceWs || _voiceStarting) {
+        if (userTap) { _userStopped = true; _stopVoice(); }
         return;
       }
-      let stream;
+      _voiceStarting = true;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-        });
-      } catch (e) {
-        sys(e.name === 'NotAllowedError'
-          ? 'Microphone denied — tap the address bar lock and allow microphone.'
-          : 'Mic error: ' + e.message);
-        return;
-      }
-
-      // 16 kHz context (fall back to native rate — _f32toPcm16 resamples)
-      let ctx;
-      try { ctx = new AudioContext({ sampleRate: 16000 }); }
-      catch (_) { ctx = new AudioContext(); }
-      if (ctx.state === 'suspended') await ctx.resume();
-
-      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(
-        `${wsProto}://${location.host}/ws/phone-audio?token=${encodeURIComponent(_authToken)}`
-      );
-      ws.binaryType = 'arraybuffer';
-
-      ws.onopen = async () => {
-        const rate = ctx.sampleRate;
-        const src  = ctx.createMediaStreamSource(stream);
-
-        // AudioWorklet (modern) — runs in dedicated audio thread
-        const wCode = `class J extends AudioWorkletProcessor{process(i){const c=i[0]?.[0];if(c)this.port.postMessage(c.slice());return true;}}registerProcessor('j',J);`;
-        try {
-          const burl = URL.createObjectURL(new Blob([wCode], { type: 'application/javascript' }));
-          await ctx.audioWorklet.addModule(burl);
-          URL.revokeObjectURL(burl);
-          const nd = new AudioWorkletNode(ctx, 'j');
-          // Buffer to 1024 samples (64 ms at 16 kHz) before sending —
-          // matches PC mic chunk size, prevents queue flooding on the server.
-          let _pbuf = [], _plen = 0;
-          nd.port.onmessage = e => {
-            const chunk = new Int16Array(_f32toPcm16(e.data, rate));
-            _pbuf.push(chunk); _plen += chunk.length;
-            if (_plen >= 1024) {
-              const out = new Int16Array(_plen); let off = 0;
-              for (const c of _pbuf) { out.set(c, off); off += c.length; }
-              if (ws.readyState === 1) ws.send(out.buffer);
-              _pbuf = []; _plen = 0;
-            }
-          };
-          src.connect(nd);
-          _audioNd = nd;
-        } catch (_) {
-          // ScriptProcessor fallback (deprecated, still works everywhere)
-          const sp = ctx.createScriptProcessor(4096, 1, 1);
-          sp.onaudioprocess = e => {
-            if (ws.readyState === 1) ws.send(_f32toPcm16(e.inputBuffer.getChannelData(0), rate));
-          };
-          src.connect(sp); sp.connect(ctx.destination);
-          _audioNd = sp;
+        if (!navigator.mediaDevices?.getUserMedia) {
+          if (userTap) _showVoiceSetup();
+          return;
         }
 
-        micBtn.innerHTML = '⏹';
-        micBtn.title     = 'Tap to stop';
-        micBtn.classList.add('recording');
-        sys('Voice live — speak now');
-        toast('🎤 Live');
-      };
+        // Reuse the live mic stream across reconnects when we still own it.
+        let stream = _micStm;
+        if (!stream || stream.getTracks().every(t => t.readyState !== 'live')) {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+            });
+          } catch (e) {
+            if (userTap) {
+              sys(e.name === 'NotAllowedError'
+                ? 'Microphone denied — tap the address bar lock and allow microphone.'
+                : 'Mic error: ' + e.message);
+            } else {
+              _showVoiceSetup();   // insecure origin / not granted yet
+            }
+            return;
+          }
+        }
+        _micStm = stream;
 
-      ws.onclose = () => { _stopVoice(); };
-      ws.onerror = () => { sys('Voice connection failed.'); _stopVoice(); };
+        // 16 kHz context (fall back to native rate — _f32toPcm16 resamples)
+        let ctx = _audioCtx;
+        if (!ctx) {
+          try { ctx = new AudioContext({ sampleRate: 16000 }); }
+          catch (_) { ctx = new AudioContext(); }
+          _audioCtx = ctx;
+        }
+        if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (_) {} }
+        if (ctx.state !== 'running') {
+          // Browsers only allow audio to start inside a user gesture.
+          if (userTap) sys('Tap once more to start the microphone.');
+          _showTapToStart();
+          return;
+        }
 
-      _voiceWs  = ws;
-      _audioCtx = ctx;
-      _micStm   = stream;
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(
+          `${wsProto}://${location.host}/ws/phone-audio?token=${encodeURIComponent(_authToken)}`
+        );
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = async () => {
+          _reconnectDelay = 2000;
+          const rate = ctx.sampleRate;
+          const src  = ctx.createMediaStreamSource(stream);
+
+          // AudioWorklet (modern) — runs in dedicated audio thread
+          const wCode = `class J extends AudioWorkletProcessor{process(i){const c=i[0]?.[0];if(c)this.port.postMessage(c.slice());return true;}}registerProcessor('j',J);`;
+          try {
+            const burl = URL.createObjectURL(new Blob([wCode], { type: 'application/javascript' }));
+            await ctx.audioWorklet.addModule(burl);
+            URL.revokeObjectURL(burl);
+            const nd = new AudioWorkletNode(ctx, 'j');
+            // Buffer to 1024 samples (64 ms at 16 kHz) before sending —
+            // matches PC mic chunk size, prevents queue flooding on the server.
+            let _pbuf = [], _plen = 0;
+            nd.port.onmessage = e => {
+              const chunk = new Int16Array(_f32toPcm16(e.data, rate));
+              _pbuf.push(chunk); _plen += chunk.length;
+              if (_plen >= 1024) {
+                const out = new Int16Array(_plen); let off = 0;
+                for (const c of _pbuf) { out.set(c, off); off += c.length; }
+                if (ws.readyState === 1) ws.send(out.buffer);
+                _pbuf = []; _plen = 0;
+              }
+            };
+            src.connect(nd);
+            _audioNd = nd;
+          } catch (_) {
+            // ScriptProcessor fallback (deprecated, still works everywhere)
+            const sp = ctx.createScriptProcessor(4096, 1, 1);
+            sp.onaudioprocess = e => {
+              if (ws.readyState === 1) ws.send(_f32toPcm16(e.inputBuffer.getChannelData(0), rate));
+            };
+            src.connect(sp); sp.connect(ctx.destination);
+            _audioNd = sp;
+          }
+
+          _userStopped = false;
+          micBtn.innerHTML = '⏹';
+          micBtn.title     = 'Listening — tap to stop';
+          micBtn.classList.add('recording');
+          if (userTap) { sys('Voice live — speak now'); toast('🎤 Live'); }
+          else toast('🎤 Listening');
+        };
+
+        ws.onclose = () => {
+          if (_voiceWs === ws) _voiceWs = null;
+          if (_audioNd) { try { _audioNd.disconnect(); } catch (_) {} _audioNd = null; }
+          _micIdle();
+          // Auto-reconnect unless the user chose to stop. The mic stream and
+          // audio context stay alive, so reconnecting is instant and never
+          // re-prompts for permission.
+          if (!_userStopped && _authToken) {
+            sys('Voice link dropped — reconnecting…');
+            setTimeout(() => doMic(false), _reconnectDelay);
+            _reconnectDelay = Math.min(10000, _reconnectDelay * 2);
+          }
+        };
+        ws.onerror = () => { /* onclose follows and handles recovery */ };
+
+        _voiceWs = ws;
+      } finally {
+        _voiceStarting = false;
+      }
+    }
+
+    function _showTapToStart() {
+      if (document.getElementById('tap-to-start')) return;
+      const card = document.createElement('button');
+      card.id = 'tap-to-start';
+      card.textContent = '🎤 Tap once to start listening';
+      card.style.cssText = [
+        'align-self:center', 'background:rgba(34,197,94,0.14)',
+        'border:1px solid rgba(34,197,94,0.4)', 'color:#22c55e',
+        'border-radius:99px', 'padding:10px 20px', 'font-size:13px',
+        'font-weight:700', 'cursor:pointer', 'animation:pop 0.18s ease'
+      ].join(';');
+      card.onclick = () => { card.remove(); doMic(true); };
+      feed.appendChild(card);
+      feed.scrollTop = feed.scrollHeight;
     }
 
     function _stopVoice() {
+      _userStopped = true;
       if (_audioNd)  { try { _audioNd.disconnect(); }  catch (_) {}; _audioNd  = null; }
-      if (_audioCtx) { try { _audioCtx.close(); }      catch (_) {}; _audioCtx = null; }
-      if (_micStm)   { _micStm.getTracks().forEach(t => t.stop()); _micStm = null; }
       if (_voiceWs)  {
         const w = _voiceWs; _voiceWs = null;
         if (w.readyState < 2) w.close();
       }
+      if (_micStm)   { _micStm.getTracks().forEach(t => t.stop()); _micStm = null; }
+      if (_audioCtx) { try { _audioCtx.close(); }      catch (_) {}; _audioCtx = null; }
       _micIdle();
     }
+
+    // Listening starts by itself when the dashboard opens — no button needed.
+    _updateTtsBtn();
+    if (navigator.mediaDevices?.getUserMedia) doMic(false);
+    else _showVoiceSetup();
   </script>
 </body>
 </html>
