@@ -6,5 +6,3 @@ __pycache__/
 config/api_keys.json
 config/certs/
 memory/long_term.json
-barehands/state/
-barehands/barehands.json

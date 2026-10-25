@@ -77,6 +77,7 @@ from core                      import confirm as confirm_gate
 from core.local_router         import handle_local_request
 from core.local_speech         import LocalSpeaker
 from core                      import audio_devices
+from core                      import mic_router
 from core.action_loader        import discover_actions
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -407,8 +408,11 @@ class JarvisLive:
         self._local_speaker = LocalSpeaker(
             on_start=lambda: self._set_speaking_from_worker(True),
             on_done=lambda: self._set_speaking_from_worker(False),
+            output_device_provider=self._local_output_device,
             logger=self._log_local_speech,
         )
+        self._last_tts_notice = ""   # dedupes the local-voice error in the UI log
+        self._mic_drop = mic_router.DropStreak()
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
 
@@ -434,8 +438,8 @@ class JarvisLive:
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
-        # Bind plugin state bridges immediately. The Barehands ring must become
-        # active when the Live session connects, not on the first board click.
+        # Bind plugin state bridges immediately so any plugin that mirrors live
+        # state is wired at startup, not on its first tool call.
         self._plugin_registry.attach(self.ui)
 
         # ── Wake word ────────────────────────────────────────────────────────
@@ -518,6 +522,7 @@ class JarvisLive:
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
+        warned = False
         while True:
             await asyncio.sleep(5)
             if not self._wake_enabled or not self._awake:
@@ -527,6 +532,20 @@ class JarvisLive:
             if speaking:
                 continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
+                det = self._wake_detector
+                if not (det and det.ready):
+                    # Sleeping now would strand voice input: only the local
+                    # detector can hear "Hey Jarvis", and it is not running.
+                    # Stay awake so the microphone keeps working; the user can
+                    # still sleep manually or finish the wake-word download.
+                    if not warned:
+                        warned = True
+                        self.ui.write_log(
+                            "SYS: Wake word is enabled but its model is not "
+                            "ready, so auto-sleep is paused — listening stays on."
+                        )
+                    continue
+                warned = False
                 self.sleep(reason="no speech for 2 minutes")
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
@@ -793,7 +812,7 @@ class JarvisLive:
                     "ts": datetime.now().isoformat(),
                 }))
             if not self.ui.muted:
-                self._local_speaker.speak(local.text)
+                self._speak_local(local.text)
             return
 
         if not self.session:
@@ -806,6 +825,16 @@ class JarvisLive:
             )
         except Exception as e:
             self.ui.write_log(f"ERR: Could not send request to Gemini — {e}")
+
+    def _speak_local(self, text: str) -> None:
+        """Speak a local reply; if the local voice service cannot, keep the
+        text reply and surface its specific reason ONCE (not per message)."""
+        if self._local_speaker.speak(text):
+            return
+        reason = self._local_speaker.last_error
+        if reason and reason != self._last_tts_notice:
+            self._last_tts_notice = reason
+            self.ui.write_log(f"SYS: {reason}")
 
     def _on_text_command(self, text: str):
         if not self._loop:
@@ -827,10 +856,22 @@ class JarvisLive:
             loop.call_soon_threadsafe(self.set_speaking, value)
 
     def _log_local_speech(self, message: str) -> None:
-        print(f"[LocalSpeech] {message}")
+        """Local voice service log. Console lines carry the [local-voice]
+        marker; the same text lands in the on-screen log as a SYS line."""
+        print(f"[local-voice] {message}")
         loop = self._loop
         if loop and loop.is_running():
             loop.call_soon_threadsafe(self.ui.write_log, f"SYS: {message}")
+
+    def _local_output_device(self):
+        """Resolve the configured speaker for the local voice service, so its
+        audio plays through the same device as the Gemini voice. None means
+        the PortAudio default — which must never raise into the speech
+        worker."""
+        try:
+            return audio_devices.resolve(get_output_device(), "output")
+        except Exception:
+            return None
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -854,6 +895,9 @@ class JarvisLive:
                     break
             if drained:
                 print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+        # Silence the local voice path too (drops queued replies and stops
+        # sounddevice playback at once).
+        self._local_speaker.cancel()
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -1153,25 +1197,42 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
-            # ── Wake-word gate ───────────────────────────────────────────────
-            # While asleep, the mic audio NEVER goes to Gemini (nothing is
-            # streamed, so JARVIS can't respond to speech not addressed to it and
-            # nothing leaves the machine). Frames are instead handed to the local
-            # detector, which runs its model in ITS OWN thread — the cost here is
-            # only a queue push, so the audio path is never slowed. When wake word
-            # is off (default) or we're awake, this is a single boolean check.
-            if self._wake_enabled and not self._awake:
+            # ── Frame routing (see core/mic_router.py) ──────────────────────
+            # One pure function decides what happens to this frame: the wake
+            # gate, the mute/phone/echo gates, then local Whisper or the
+            # Gemini session. External applications — boards, plugins,
+            # anything else — are deliberately absent from this decision; the
+            # microphone's lifecycle depends on the assistant state alone.
+            det_ready = bool(self._wake_detector and self._wake_detector.ready)
+            with self._speaking_lock:
+                jarvis_speaking = self._is_speaking
+            action, detail = mic_router.route_frame(
+                wake_enabled=self._wake_enabled,
+                awake=self._awake,
+                wake_detector_ready=det_ready,
+                speaking=jarvis_speaking,
+                muted=self.ui.muted,
+                phone_active=self._phone_active,
+                local_stt_ready=bool(
+                    self._local_audio_queue is not None and self._local_stt_ready
+                ),
+                session_connected=bool(self.session and self.out_queue is not None),
+            )
+
+            notice = self._mic_drop.record(action)
+            if notice:
+                self.ui.write_log(f"SYS: {notice}")
+
+            if action == mic_router.WAKE:
                 det = self._wake_detector
                 if det is not None:
                     det.feed(indata)
                 return
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+            if action in (mic_router.LOCAL, mic_router.GEMINI):
                 data = indata.tobytes()
-                if self._local_audio_queue is not None and self._local_stt_ready:
+                if action == mic_router.LOCAL:
                     loop.call_soon_threadsafe(self._enqueue_local_audio, data)
-                elif self.session and self.out_queue is not None:
+                else:
                     # Compatibility fallback while the local speech model is
                     # downloading/unavailable. Once ready, mic PCM stays local.
                     loop.call_soon_threadsafe(self._queue_live_audio, data)
@@ -1380,10 +1441,32 @@ class JarvisLive:
             # open (exclusive mode, wrong sample rate, device asleep) must not
             # cost the user their voice. Fall back to the default and say so.
             if _spk_dev is None:
-                raise
-            print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
-            self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
-            stream = _open_spk(None)
+                stream = None
+            else:
+                print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
+                self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
+                try:
+                    stream = _open_spk(None)
+                except Exception as _e2:
+                    stream = None
+                    _e = _e2
+            if stream is None:
+                # No output device can be opened at all. Raising here would tear
+                # down the whole session TaskGroup and put JARVIS into an endless
+                # reconnect loop with the mic effectively dead. Instead: keep the
+                # session, drain audio, and say exactly what is wrong — text and
+                # microphone keep working.
+                self.ui.write_log(
+                    "ERR: No usable audio output device — JARVIS runs without "
+                    f"sound (replies still appear as text). Check that a speaker "
+                    f"or headset is connected and selected. ({_e})"
+                )
+                print(f"[JARVIS] 🔇 No output device: {_e} — running text-only")
+                while True:
+                    try:
+                        await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        continue
 
         try:
             while True:
@@ -1430,8 +1513,9 @@ class JarvisLive:
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            if stream is not None:
+                stream.stop()
+                stream.close()
 
     # ── Startup status ─────────────────────────────────────────────────────────
 
@@ -1443,7 +1527,7 @@ class JarvisLive:
         line = f"{self._asst_name} online and ready."
         self.ui.write_log("SYS: Startup status sent (local speech).")
         if not self.ui.muted:
-            self._local_speaker.speak(line)
+            self._speak_local(line)
 
         # Optional headlines remain on the screen and are fetched in the
         # background. The local startup announcement never waits for them.
