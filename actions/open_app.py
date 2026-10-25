@@ -1,4 +1,3 @@
-import time
 import subprocess
 import platform
 import shutil
@@ -75,7 +74,7 @@ def _normalize(raw: str) -> str:
         if alias_key in key or key in alias_key:
             return os_map.get(_SYSTEM, raw)
 
-    return raw  
+    return raw
 
 def _launch_windows(app_name: str) -> bool:
 
@@ -87,7 +86,7 @@ def _launch_windows(app_name: str) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(1.5)
+
             return True
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
@@ -95,7 +94,7 @@ def _launch_windows(app_name: str) -> bool:
     if ":" in app_name:
         try:
             subprocess.Popen(f"start {app_name}", shell=True)
-            time.sleep(1.0)
+
             return True
         except Exception:
             pass
@@ -104,11 +103,11 @@ def _launch_windows(app_name: str) -> bool:
         import pyautogui
         pyautogui.PAUSE = 0.1
         pyautogui.press("win")
-        time.sleep(0.7)
+
         pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
+
         pyautogui.press("enter")
-        time.sleep(2.5)
+
         return True
     except Exception as e:
         print(f"[open_app] Start Menu search failed: {e}")
@@ -124,7 +123,7 @@ def _launch_macos(app_name: str) -> bool:
             capture_output=True, timeout=8
         )
         if result.returncode == 0:
-            time.sleep(1.0)
+
             return True
     except Exception:
         pass
@@ -135,7 +134,7 @@ def _launch_macos(app_name: str) -> bool:
             capture_output=True, timeout=8
         )
         if result.returncode == 0:
-            time.sleep(1.0)
+
             return True
     except Exception:
         pass
@@ -148,7 +147,7 @@ def _launch_macos(app_name: str) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            time.sleep(1.0)
+
             return True
         except Exception:
             pass
@@ -156,11 +155,11 @@ def _launch_macos(app_name: str) -> bool:
     try:
         import pyautogui
         pyautogui.hotkey("command", "space")
-        time.sleep(0.6)
+
         pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
+
         pyautogui.press("enter")
-        time.sleep(1.5)
+
         return True
     except Exception as e:
         print(f"[open_app] Spotlight failed: {e}")
@@ -181,7 +180,7 @@ def _launch_linux(app_name: str) -> bool:
             if shutil.which(term):
                 try:
                     subprocess.Popen([term], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(1.0)
+
                     return True
                 except Exception:
                     continue
@@ -199,15 +198,15 @@ def _launch_linux(app_name: str) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            time.sleep(1.0)
+
             return True
         except Exception:
             pass
 
     try:
-        subprocess.run(
+        subprocess.Popen(
             ["xdg-open", app_name],
-            capture_output=True, timeout=5
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         return True
     except Exception:

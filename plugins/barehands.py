@@ -4,7 +4,7 @@ barehands — hand-tracked glass board for JARVIS  (drop-in plugin)
 Gives JARVIS:
   • a voice tool:  "open barehands" / "show me X on the board" / "clear the board" / "close barehands"
   • a settings panel (⚙ → PLUGIN SETTINGS → BAREHANDS): start/stop button, auto-start toggle, port, browser
-  • a live ring: JARVIS's LISTENING / THINKING / SPEAKING state is mirrored into barehands/state/
+  • a live ring: JARVIS's LISTENING / THINKING / SPEAKING state is mirrored into barehands/state/ from startup, with a heartbeat that keeps the board's stale-state timeout from showing idle
 
 barehands itself: https://github.com/jaredrhod/barehands  (AGPL-3.0). It runs as its own local
 web server; the browser page does the hand tracking with your webcam. Nothing leaves the machine.
@@ -32,6 +32,9 @@ _STATE    = _BH_DIR / "state"
 _NS       = "barehands"
 _PROC: subprocess.Popen | None = None
 _LOCK     = threading.Lock()
+_STATE_LOCK = threading.Lock()   # protects the live ring state + startup hooks
+_LAST_STATE = "idle"              # last real JARVIS state, already ring-normalised
+_HEARTBEAT_STARTED = False
 
 
 def _cfg(key, default=None):
@@ -111,6 +114,57 @@ def _open_browser(role: str = ""):
     webbrowser.open(url)
 
 
+def _normalise_ring_state(state) -> str:
+    """Accept either a JARVIS UI state or an already-normalised ring state."""
+    raw = str(state or "").strip().lower()
+    if raw in ("idle", "listening", "thinking", "speaking"):
+        return raw
+    return _STATE_MAP.get(str(state or "").strip().upper(), "idle")
+
+
+def _write_ring_state(state) -> None:
+    """Write the real assistant state and refresh its timestamp.
+
+    The board's /orb endpoint treats a non-idle state as stale after ten
+    minutes. Refreshing the file from the live process keeps an active ring
+    alive; if JARVIS exits, the heartbeat stops and the board decays to idle on
+    its own. No files are created when barehands is not installed.
+    """
+    global _LAST_STATE
+    mapped = _normalise_ring_state(state)
+    with _STATE_LOCK:
+        _LAST_STATE = mapped
+        try:
+            if not _STATE.is_dir():
+                # Avoid creating stray runtime files in a checkout without the
+                # barehands submodule. Once installed, the state dir is safe.
+                if not (_BH_DIR / "server.py").exists():
+                    return
+                _STATE.mkdir(parents=True, exist_ok=True)
+            (_STATE / "state").write_text(mapped, encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _state_heartbeat() -> None:
+    while True:
+        time.sleep(30)
+        try:
+            _write_ring_state(_LAST_STATE)
+        except Exception:
+            pass
+
+
+def _start_state_heartbeat() -> None:
+    global _HEARTBEAT_STARTED
+    with _STATE_LOCK:
+        if _HEARTBEAT_STARTED:
+            return
+        _HEARTBEAT_STARTED = True
+    threading.Thread(target=_state_heartbeat, daemon=True,
+                     name="BarehandsStateHeartbeat").start()
+
+
 def start(open_page: bool = True) -> tuple[bool, str]:
     global _PROC
     with _LOCK:
@@ -128,8 +182,10 @@ def start(open_page: bool = True) -> tuple[bool, str]:
                 time.sleep(0.1)
             if not _alive():
                 return False, "the barehands server did not come up — check the port in settings."
+        # Mirror the assistant's ACTUAL current state. Starting the board is
+        # not itself an assistant state change and must not falsely wake the ring.
         _STATE.mkdir(exist_ok=True)
-        (_STATE / "state").write_text("listening")
+        _write_ring_state(_LAST_STATE)
         if open_page:
             _open_browser()
         return True, f"barehands is up at {_url()}"
@@ -138,10 +194,8 @@ def start(open_page: bool = True) -> tuple[bool, str]:
 def stop() -> tuple[bool, str]:
     global _PROC
     with _LOCK:
-        try:
-            (_STATE / "state").write_text("idle")
-        except Exception:
-            pass
+        # Keep reflecting the real assistant state if the board is restarted.
+        _write_ring_state(_LAST_STATE)
         if _PROC and _PROC.poll() is None:
             try:
                 os.killpg(os.getpgid(_PROC.pid), signal.SIGTERM)
@@ -184,25 +238,40 @@ _hooked = False
 
 
 def _hook_state(player):
-    """Wrap player.set_state once so every state change also lands in the board's ring."""
-    global _hooked
-    if _hooked or player is None or not hasattr(player, "set_state"):
-        return
-    orig = player.set_state
+    """Wrap player.set_state once so every state change also lands in the ring.
 
-    def wrapped(state, *a, **k):
+    Called from attach() at app startup, not lazily on the first Barehands voice
+    command. Before this fix the ring did not know JARVIS was online until the
+    user clicked the Barehands button or invoked the barehands tool.
+    """
+    global _hooked
+    with _STATE_LOCK:
+        if _hooked or player is None or not hasattr(player, "set_state"):
+            return
+        orig = player.set_state
+
+        def wrapped(state, *a, **k):
+            _write_ring_state(state)
+            return orig(state, *a, **k)
+
         try:
-            if _STATE.exists():
-                (_STATE / "state").write_text(_STATE_MAP.get(str(state).upper(), "idle"))
+            player.set_state = wrapped
+            _hooked = True
         except Exception:
             pass
-        return orig(state, *a, **k)
 
-    try:
-        player.set_state = wrapped
-        _hooked = True
-    except Exception:
-        pass
+
+def attach(player=None) -> None:
+    """Plugin lifecycle hook: bind the live ring as soon as JARVIS starts."""
+    if player is not None:
+        _hook_state(player)
+    # Start with an honest idle state. main.py emits LISTENING on connect,
+    # which immediately changes this to "listening" without a button press.
+    _write_ring_state("idle")
+    if (_BH_DIR / "server.py").exists():
+        _start_state_heartbeat()
+    threading.Thread(target=_autostart, daemon=True,
+                     name="BarehandsAutoStart").start()
 
 
 # @@IMG@@ ── images on the glass ────────────────────────────────────────────────
@@ -410,7 +479,7 @@ PLUGIN_SETTINGS = {
     "namespace": _NS,
     "title": "BAREHANDS — hand-tracked board",
     "fields": [
-        {"key": "autostart",  "type": "toggle", "label": "Start barehands with JARVIS", "default": False},
+        {"key": "autostart",  "type": "toggle", "label": "Start barehands with JARVIS", "default": True},
         {"key": "app_window", "type": "toggle", "label": "Open as its own window (no tabs)", "default": True},
         {"key": "browser",    "type": "choice", "label": "Browser",
          "options": ["opera", "default", "chrome", "brave"], "default": "opera"},
@@ -423,13 +492,11 @@ PLUGIN_SETTINGS = {
 
 # ── auto-start ────────────────────────────────────────────────────────────────
 def _autostart():
-    time.sleep(6)                                   # let JARVIS finish booting
+    time.sleep(2)                                   # let the Live session begin connecting
     try:
-        if str(_cfg("autostart", False)).lower() in ("1", "true", "yes", "on"):
-            start(open_page=True)
-    except Exception:
-        pass
-
-
-threading.Thread(target=_autostart, daemon=True).start()
-
+        if str(_cfg("autostart", True)).lower() in ("1", "true", "yes", "on"):
+            ok, msg = start(open_page=True)
+            if not ok:
+                print(f"[Barehands] Auto-start skipped: {msg}")
+    except Exception as e:
+        print(f"[Barehands] Auto-start failed: {e}")

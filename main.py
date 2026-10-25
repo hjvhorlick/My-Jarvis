@@ -51,7 +51,7 @@ from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
-    save_session_summary, pop_last_session,
+    save_session_summary,
     search_memory, set_trim_notifier,
 )
 
@@ -74,14 +74,16 @@ from memory.config_manager     import (
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
+from core.local_router         import handle_local_request
+from core.local_speech         import LocalSpeaker
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
 
-# How long the assistant stays awake with no user speech before it auto-sleeps
-# again (wake-word mode only).
+# JARVIS always starts awake. When wake-word mode is enabled, it auto-sleeps
+# after this much silence and can be woken again with "Hey Jarvis".
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
 def get_base_dir():
@@ -385,17 +387,28 @@ class JarvisLive:
         # Deliberately in RAM only, never written to disk. Persisting it would
         # make a fresh launch continue yesterday's conversation, which sounds
         # appealing but breaks the session-summary flow: _save_session_summary
-        # runs at shutdown and the morning briefing pops it the next day. A
-        # conversation that never ends never produces a summary, and the
-        # "yesterday we talked about…" line silently disappears.
+        # runs at shutdown, and a conversation that never ends never produces a
+        # summary. Startup is deliberately a short status line, not a recap.
         self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
-        self._briefing_sent    = False          # morning briefing fires once per process
+        self._startup_status_sent = False       # short "online" line, once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
-        self._proactive        = ProactiveEngine()
+        self._proactive        = ProactiveEngine()  # event dedupe / prompt builder
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+
+        # Desktop speech is transcribed locally once the optional tiny Whisper
+        # model is ready. Known requests stay on-device; only unmatched text is
+        # forwarded to the Gemini Live session.
+        self._local_stt = None
+        self._local_stt_ready = False
+        self._local_audio_queue: asyncio.Queue | None = None
+        self._local_speaker = LocalSpeaker(
+            on_start=lambda: self._set_speaking_from_worker(True),
+            on_done=lambda: self._set_speaking_from_worker(False),
+            logger=self._log_local_speech,
+        )
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
 
@@ -421,12 +434,16 @@ class JarvisLive:
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+        # Bind plugin state bridges immediately. The Barehands ring must become
+        # active when the Live session connects, not on the first board click.
+        self._plugin_registry.attach(self.ui)
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
-        # It is True whenever wake word is OFF, so default behaviour is unchanged.
+        # Always start ready. Wake-word mode still works: after the silence
+        # timeout JARVIS sleeps, and "Hey Jarvis" or WAKE NOW brings it back.
         self._wake_enabled     = get_wake_word_enabled()
-        self._awake            = not self._wake_enabled
+        self._awake            = True
         self._wake_detector: WakeWordDetector | None = None
         self._wake_sleep_timeout = WAKE_SLEEP_TIMEOUT
         # UI control surface for the Wake Word settings section.
@@ -459,6 +476,27 @@ class JarvisLive:
         """Called from the detector thread when 'Hey Jarvis' is heard."""
         self.wake(reason="wake word")
 
+    def _broadcast_dashboard_state(self) -> None:
+        """Keep remote status in sync when wake/sleep changes off-loop."""
+        loop = self._loop
+        dashboard = self._dashboard
+        if not loop or not dashboard or not loop.is_running():
+            return
+
+        async def _send():
+            try:
+                await dashboard.broadcast({
+                    "type": "status",
+                    "state": "active" if self._awake else "sleeping",
+                })
+            except Exception as e:
+                print(f"[Dashboard] Status update failed: {e}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        except Exception as e:
+            print(f"[Dashboard] Could not schedule status update: {e}")
+
     def wake(self, reason: str = "wake word") -> None:
         if self._awake:
             return
@@ -467,6 +505,7 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
         self.ui.write_log(f"SYS: Awake — {reason}.")
+        self._broadcast_dashboard_state()
 
     def sleep(self, reason: str = "timeout") -> None:
         if not self._awake:
@@ -475,6 +514,7 @@ class JarvisLive:
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
+        self._broadcast_dashboard_state()
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
@@ -608,22 +648,189 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
-    def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+    async def _load_local_voice(self) -> None:
+        """Warm local speech and transcription in the background.
+
+        The tiny English model downloads once on first run and is cached by
+        faster-whisper. While it loads, the previous Gemini audio path remains
+        available as a compatibility fallback.
+        """
+        self._local_speaker.start()
+        try:
+            from core.stt import WhisperSTT
+            self._local_stt = await asyncio.to_thread(WhisperSTT, "tiny.en")
+            self._local_stt_ready = True
+            self.ui.write_log("SYS: Local English speech recognition is ready.")
+            # Discard any startup audio already queued for Gemini; subsequent
+            # desktop microphone blocks are routed through local STT.
+            if self.out_queue:
+                while True:
+                    try:
+                        self.out_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+        except Exception as e:
+            self._local_stt = None
+            self._local_stt_ready = False
+            self.ui.write_log(
+                "SYS: Local speech recognition is unavailable; voice commands "
+                "will use Gemini until it is installed."
+            )
+            print(f"[LocalSTT] Could not load tiny.en: {e}")
+
+    def _queue_live_audio(self, data: bytes) -> None:
+        """Queue microphone PCM only while a Gemini session is available."""
+        q = self.out_queue
+        if not self.session or q is None:
             return
-        # Respect wake-word sleep: a typed command must not be answered while
-        # asleep either (the sleep gate is not just for the mic). Wake first with
-        # "Hey Jarvis" or the WAKE NOW button.
+        try:
+            q.put_nowait({"data": data, "mime_type": "audio/pcm"})
+        except asyncio.QueueFull:
+            pass
+
+    def _enqueue_local_audio(self, data: bytes) -> None:
+        q = self._local_audio_queue
+        if q is None:
+            return
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            # Prefer current speech over stale frames when inference falls behind.
+            try:
+                q.get_nowait()
+                q.put_nowait(data)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+    async def _process_local_audio(self) -> None:
+        """Segment microphone audio on silence, then transcribe locally."""
+        if self._local_audio_queue is None:
+            return
+        pre_roll: list[bytes] = []
+        utterance: list[bytes] = []
+        active = False
+        silent_secs = 0.0
+        speech_secs = 0.0
+        sample_count = CHUNK_SIZE
+        frame_secs = sample_count / SEND_SAMPLE_RATE
+
+        while True:
+            try:
+                data = await asyncio.wait_for(self._local_audio_queue.get(), timeout=0.15)
+            except asyncio.TimeoutError:
+                continue
+
+            try:
+                pcm = np.frombuffer(data, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) if pcm.size else 0.0
+            except Exception:
+                continue
+
+            if not active:
+                pre_roll.append(data)
+                pre_roll = pre_roll[-5:]
+                if rms >= 180.0:
+                    active = True
+                    utterance = list(pre_roll)
+                    speech_secs = frame_secs
+                    silent_secs = 0.0
+                continue
+
+            utterance.append(data)
+            if rms >= 180.0:
+                speech_secs += frame_secs
+                silent_secs = 0.0
+            else:
+                silent_secs += frame_secs
+
+            if silent_secs >= 0.55 or speech_secs >= 15.0:
+                audio_bytes = b"".join(utterance)
+                active = False
+                pre_roll = []
+                utterance = []
+                silent_secs = 0.0
+                if speech_secs < 0.25 or not self._local_stt_ready or not self._local_stt:
+                    speech_secs = 0.0
+                    continue
+                speech_secs = 0.0
+                try:
+                    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    text = await asyncio.to_thread(self._local_stt.transcribe, audio)
+                except Exception as e:
+                    print(f"[LocalSTT] Transcription failed: {e}")
+                    continue
+                text = _clean_transcript(text)
+                if text and self._awake:
+                    await self._handle_user_text(text, source="voice")
+
+    async def _handle_user_text(self, text: str, source: str = "text") -> None:
+        """Run known intents locally; send only unmatched requests to Gemini."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._last_user_speech = time.monotonic()
+        self._session_log.append(f"User: {text}")
+        if source == "voice":
+            self.ui.write_log(f"You: {text}")
+        if self._dashboard:
+            asyncio.create_task(self._dashboard.broadcast({
+                "type": "log", "speaker": "user", "text": text,
+                "ts": datetime.now().isoformat(),
+            }))
+
+        try:
+            local = await asyncio.to_thread(handle_local_request, text)
+        except Exception as e:
+            print(f"[LocalRouter] {e}")
+            local = None
+
+        if local is not None:
+            self.ui.write_log(f"{self._asst_name}: {local.text}")
+            self._session_log.append(f"{self._asst_name}: {local.text}")
+            if self._dashboard:
+                asyncio.create_task(self._dashboard.broadcast({
+                    "type": "log", "speaker": "jarvis", "text": local.text,
+                    "ts": datetime.now().isoformat(),
+                }))
+            if not self.ui.muted:
+                self._local_speaker.speak(local.text)
+            return
+
+        if not self.session:
+            self.ui.write_log("SYS: Gemini is not connected, so I can't answer that yet.")
+            return
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": text}]},
+                turn_complete=True,
+            )
+        except Exception as e:
+            self.ui.write_log(f"ERR: Could not send request to Gemini — {e}")
+
+    def _on_text_command(self, text: str):
+        if not self._loop:
+            return
+        # Respect wake-word sleep for both local and Gemini-backed requests.
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_user_text(text, source="text"), self._loop
+            )
+        except Exception as e:
+            self.ui.write_log(f"ERR: Could not queue request — {e}")
+
+    def _set_speaking_from_worker(self, value: bool) -> None:
+        loop = self._loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(self.set_speaking, value)
+
+    def _log_local_speech(self, message: str) -> None:
+        print(f"[LocalSpeech] {message}")
+        loop = self._loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(self.ui.write_log, f"SYS: {message}")
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -934,6 +1141,13 @@ class JarvisLive:
                 )
             )
 
+    def _report_mic_failure(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            self.ui.write_log(f"ERR: Microphone unavailable — {error}")
+
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
@@ -955,10 +1169,12 @@ class JarvisLive:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                if self._local_audio_queue is not None and self._local_stt_ready:
+                    loop.call_soon_threadsafe(self._enqueue_local_audio, data)
+                elif self.session and self.out_queue is not None:
+                    # Compatibility fallback while the local speech model is
+                    # downloading/unavailable. Once ready, mic PCM stays local.
+                    loop.call_soon_threadsafe(self._queue_live_audio, data)
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
@@ -1217,133 +1433,35 @@ class JarvisLive:
             stream.stop()
             stream.close()
 
-    # ── Morning briefing ────────────────────────────────────────────────────────
+    # ── Startup status ─────────────────────────────────────────────────────────
 
-    async def _send_startup_briefing(self) -> None:
-        """
-        Two-phase briefing optimized for speed:
-          Phase 1 — instant greeting (no tools) → speech starts in <1s
-          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
-                    delivered as ready text (no Gemini tool-call round-trip) and
-                    shown on the UI content panel. Waits for turn_complete event
-                    instead of a fixed sleep so there is no unnecessary gap.
-        """
-        memory   = load_memory()
-        identity = memory.get("identity", {})
+    async def _send_startup_status(self) -> None:
+        """Announce readiness with the local system voice, never a model call."""
+        await asyncio.sleep(0.15)
+        if not self._awake:
+            return
+        line = f"{self._asst_name} online and ready."
+        self.ui.write_log("SYS: Startup status sent (local speech).")
+        if not self.ui.muted:
+            self._local_speaker.speak(line)
 
-        def _val(k: str) -> str:
-            e = identity.get(k, {})
-            return (e.get("value", "") if isinstance(e, dict) else str(e)).strip()
-
-        lang = _val("language")
-        name = _val("name")
-        time_str = datetime.now().strftime("%H:%M")
-
-        # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
-        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
-
-        await asyncio.sleep(0.3)
-        if not self.session:
+        # Optional headlines remain on the screen and are fetched in the
+        # background. The local startup announcement never waits for them.
+        if not get_brief_enabled():
             return
 
-        # ── Phase 1: instant greeting ─────────────────────────────────────────
-        # The briefing fires before the user has said anything, so the
-        # remembered language is the only signal there is. It is a starting
-        # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
-                       f"user's own language from their first reply onward."
-                       if lang else "")
-        name_clause = f" Address the user as {name}." if name else ""
-
-        # Inject last session context if available — pop removes it so it's never repeated
-        last = await asyncio.to_thread(pop_last_session)
-        session_clause = ""
-        if last:
+        async def _show_briefing():
             try:
-                _delta = (datetime.now() - datetime.strptime(last["date"], "%Y-%m-%d")).days
-                _when  = "earlier today" if _delta == 0 else ("yesterday" if _delta == 1 else f"{_delta} days ago")
-            except Exception:
-                _when = "last time"
-            session_clause = (
-                f" Also briefly and naturally mention that {_when}: {last['summary']}"
-            )
-
-        p1 = (
-            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
-        )
-
-        # Clear the turn-done event so we can wait for Phase 1 to finish
-        if self._turn_done_event:
-            self._turn_done_event.clear()
-
-        await self.session.send_client_content(
-            turns={"role": "user", "parts": [{"text": p1}]},
-            turn_complete=True,
-        )
-        self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
-
-        # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
-        async def _deliver_news():
-            try:
-                lang_str = (f" Speak in {lang} unless the user has since "
-                            f"spoken another language, in which case use theirs."
-                            if lang else "")
-
-                # Wait for news fetch (already running) and Phase 1 turn-complete
-                # in parallel — whichever takes longer determines the wait time
-                news_done   = asyncio.wrap_future(news_future)
-                turn_waited = False
-                if self._turn_done_event:
-                    try:
-                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=6.0)
-                        turn_waited = True
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Extra buffer: turn_complete fires when Gemini finishes *generating*
-                # Phase 1, but audio may still be playing.  Waiting a beat here
-                # prevents Phase 2 audio from arriving while Phase 1 is mid-sentence
-                # (which sounds like a "repeated first response" to the user).
-                if turn_waited:
-                    await asyncio.sleep(0.8)
-                else:
-                    await asyncio.sleep(1.0)
-
-                try:
-                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
-                except Exception:
-                    news_text = ""
-
-                if not self.session:
-                    return
-
-                if news_text and len(news_text) > 60:
-                    # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
-
-                    p2 = (
-                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
-                        "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
-                    )
-                else:
-                    p2 = (
-                        "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
-                    )
-
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": p2}]},
-                    turn_complete=True,
+                news_text = await asyncio.to_thread(
+                    _fetch_news_sync, "top world news today"
                 )
-                self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
+                if news_text and len(news_text) > 60 and self.session:
+                    self.ui.show_content("NEWS — top world news today", news_text)
+                    self.ui.write_log("SYS: News briefing displayed (silent).")
             except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
-                self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
+                print(f"[Startup] Briefing fetch failed: {e}")
 
-        asyncio.create_task(_deliver_news())
+        asyncio.create_task(_show_briefing())
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
@@ -1393,11 +1511,18 @@ class JarvisLive:
                 speaking = self._is_speaking
             if speaking or (time.monotonic() - self._last_user_speech) < 10:
                 continue
+            if self._proactive.seen(alert):
+                continue
+            prompt = self._proactive.build_alert_prompt(
+                alert, recent_turns=self._session_log[-6:]
+            )
             try:
                 await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": alert}]},
+                    turns={"role": "user", "parts": [{"text": prompt}]},
                     turn_complete=True,
                 )
+                self._proactive.remember(alert)
+                self.ui.write_log("SYS: System alert sent.")
             except Exception as e:
                 print(f"[Monitor] ⚠️ Could not send alert: {e}")
 
@@ -1415,65 +1540,27 @@ class JarvisLive:
                 if not speaking and not recent_speech:
                     try:
                         alerts = await asyncio.to_thread(monitor_check_all)
-                        memory = load_memory()
-                        lang_e = memory.get("identity", {}).get("language", {})
-                        lang   = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
+                        memory = await asyncio.to_thread(load_memory)
+                        monitors = await asyncio.to_thread(list_monitors)
                         for alert in alerts:
-                            msg = (
-                                f"{alert}\n\n"
-                                f"Inform the user about this development naturally in {lang}. "
-                                "One brief sentence only."
+                            if self._proactive.seen(alert):
+                                continue
+                            msg = self._proactive.build_alert_prompt(
+                                alert,
+                                memory=memory,
+                                recent_turns=self._session_log[-6:],
+                                monitors=monitors or None,
                             )
                             await self.session.send_client_content(
                                 turns={"role": "user", "parts": [{"text": msg}]},
                                 turn_complete=True,
                             )
-                            self.ui.write_log(f"SYS: Monitor alert sent.")
+                            self._proactive.remember(alert)
+                            self.ui.write_log("SYS: Monitor alert sent.")
                             await asyncio.sleep(6)   # gap between consecutive alerts
                     except Exception as e:
                         print(f"[Monitor] ⚠️ Background check error: {e}")
             await asyncio.sleep(1800)     # check every 30 minutes
-
-    # ── Proactive mode ──────────────────────────────────────────────────────────
-
-    async def _run_proactive_mode(self) -> None:
-        """
-        Background task: periodically checks if the user has been silent long enough,
-        then hands time + memory context to Gemini so it can decide what (if anything)
-        to say proactively. No hardcoded rules — Gemini makes the call.
-        """
-        while True:
-            await asyncio.sleep(60)   # evaluate once per minute
-
-            if not self.session or not self._awake:
-                continue
-
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if speaking:
-                continue
-
-            if not self._proactive.should_trigger(self._last_user_speech):
-                continue
-
-            self._proactive.mark_triggered()
-
-            try:
-                memory       = await asyncio.to_thread(load_memory)
-                monitors     = await asyncio.to_thread(list_monitors)
-                recent_turns = self._session_log[-8:] if self._session_log else []
-                prompt = self._proactive.build_prompt(
-                    memory       = memory,
-                    monitors     = monitors or None,
-                    recent_turns = recent_turns or None,
-                )
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": prompt}]},
-                    turn_complete=True,
-                )
-                self.ui.write_log("SYS: Proactive check-in.")
-            except Exception as e:
-                print(f"[Proactive] ⚠️ {e}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -1491,10 +1578,13 @@ class JarvisLive:
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self.ui.muted:
-                try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    pass
+                if self._local_stt_ready and self._local_audio_queue is not None:
+                    self._enqueue_local_audio(chunk.get("data", b""))
+                elif self.session and self.out_queue is not None:
+                    try:
+                        self.out_queue.put_nowait(chunk)
+                    except asyncio.QueueFull:
+                        pass
 
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
@@ -1510,23 +1600,12 @@ class JarvisLive:
                 )
                 if not text:
                     continue
-                # Wait up to 8s for session to become ready after a wake
-                for _ in range(80):
-                    if self.session:
-                        break
-                    await asyncio.sleep(0.1)
-                if self.session:
-                    # A remote command is deliberate control and the phone user
-                    # has no desktop WAKE button — so it wakes JARVIS if asleep.
-                    if self._wake_enabled and not self._awake:
-                        self.wake(reason="remote command")
-                    await self.session.send_client_content(
-                        turns={"role": "user", "parts": [{"text": text}]},
-                        turn_complete=True,
-                    )
-                    self.ui.write_log(f"[Web]: {text}")
-                else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                # Remote text can use local tools even while Gemini is
+                # reconnecting; only unknown questions need the live session.
+                if self._wake_enabled and not self._awake:
+                    self.wake(reason="remote command")
+                self.ui.write_log(f"[Web]: {text}")
+                await self._handle_user_text(text, source="remote")
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
@@ -1538,6 +1617,15 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
+        self._local_audio_queue = asyncio.Queue(maxsize=128)
+        # Keep the microphone open independently of Gemini so local speech
+        # commands still work during connection loss/reconnects.
+        mic_task = asyncio.create_task(self._listen_audio())
+        mic_task.add_done_callback(self._report_mic_failure)
+        # Speech components warm in the background so startup and the UI remain
+        # responsive. The model is cached after its first download.
+        asyncio.create_task(self._load_local_voice())
+        asyncio.create_task(self._process_local_audio())
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory
@@ -1565,8 +1653,10 @@ class JarvisLive:
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
             asyncio.create_task(self._dashboard.serve())
-            # Runs for the whole lifetime, not just inside an active session
+            # Both relays stay alive across Gemini reconnects so known local
+            # commands are available even when the cloud session is not.
             asyncio.create_task(self._process_dashboard_commands())
+            asyncio.create_task(self._relay_phone_audio())
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
@@ -1610,40 +1700,45 @@ class JarvisLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
 
-                    # Wake word: if enabled, come up ASLEEP (mic gated, silent)
-                    # until the user says "Hey Jarvis" or taps wake in the UI.
+                    # JARVIS is available as soon as the Live session connects.
+                    # Wake-word mode still loads its detector, but it no longer
+                    # gates startup: auto-sleep happens only after real silence.
                     if self._wake_enabled:
                         self._ensure_wake_detector()
-                        self._awake = False
-                        self.ui.set_state("SLEEPING")
-                        self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
-                    else:
-                        self._awake = True
+                    if self._awake:
+                        self._last_user_speech = time.monotonic()
                         self.ui.set_state("LISTENING")
                         self.ui.write_log("SYS: JARVIS online.")
+                    else:
+                        # Preserve a deliberate manual sleep across a reconnect.
+                        self.ui.set_state("SLEEPING")
+                        self.ui.write_log(
+                            "SYS: JARVIS connected — sleeping. Say 'Hey Jarvis' to wake me."
+                        )
 
                     if self._dashboard:
-                        await self._dashboard.broadcast({"type": "status", "state": "active"})
+                        await self._dashboard.broadcast({
+                            "type": "status",
+                            "state": "active" if self._awake else "sleeping",
+                        })
 
                     self._reconnect_event.clear()  # ignore requests from before this session
                     tg.create_task(self._watch_reconnect())
                     tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
-                    tg.create_task(self._run_proactive_mode())
+                    # No generic silence-triggered conversation loop. Only real
+                    # system/monitor events may speak unprompted; their prompts
+                    # are short and deduplicated by ProactiveEngine.
                     tg.create_task(self._run_sleep_watch())
-                    if self._dashboard:
-                        tg.create_task(self._relay_phone_audio())
 
-                    # Morning briefing — fires once per process launch (if enabled).
-                    # Skipped in wake-word mode: it comes up asleep, and a briefing
-                    # would mean talking while "asleep".
-                    if not self._briefing_sent and get_brief_enabled() and self._awake:
-                        self._briefing_sent = True
-                        tg.create_task(self._send_startup_briefing())
+                    # One short readiness line per process launch. Optional news
+                    # is silently displayed on the content panel, never spoken.
+                    if not self._startup_status_sent and self._awake:
+                        self._startup_status_sent = True
+                        tg.create_task(self._send_startup_status())
 
             except KeyboardInterrupt:
                 raise
